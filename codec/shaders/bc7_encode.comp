@@ -1,0 +1,612 @@
+// PixelPress HAP 1.2.0 - BC7 (Hap R) encoder, GPU compute shader (Vulkan GLSL).
+// Written for PixelPress; partition/anchor tables are the BC7 format's own.
+//
+// One invocation encodes one 4x4 block in two stages:
+//  1. choose: every candidate mode / partition / rotation gets a quick fit (principal-axis
+//     endpoints, least-squares refinement, p-bit search, nearest indices)
+//       opaque block (all alpha 255): modes 6, 5 (4 rotations), 1 and 3 (best-estimated of the
+//                                     64 partitions), 0 (best-estimated of its 16 partitions)
+//       block with alpha:             modes 6, 5 and 4 (4 rotations; mode 4 both index selections),
+//                                     7 (best-estimated partitions)
+//  2. finish: the two best candidates are fitted again with more refinement and a +-1 search on
+//     every endpoint code; the better one is packed.
+// Opaque blocks always decode to alpha exactly 255.
+//
+// Build: scripts/make-gpu-shaders.sh (glslangValidator -> SPIR-V -> codec/gpu_bc7_spirv.h).
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Pixels { uint px[]; };     // RGBA8 (R in the low byte)
+layout(std430, binding = 1) writeonly buffer Blocks { uvec4 blocks[]; };
+
+layout(push_constant) uniform Params {
+    uint width;          // padded frame width in pixels (multiple of 4)
+    uint blocksX;        // width / 4
+    uint startBlock;     // first block of this dispatch
+    uint numBlocks;      // blocks in the whole frame
+    uint partitions;     // 2-subset partitions tried per mode (best estimates first)
+    uint partitions3;    // 3-subset (mode 0) partitions tried
+    uint iterations;     // least-squares passes while choosing
+    uint nudges;         // rounds of +-1 endpoint-code search on the winner
+} pc;
+
+const uint kW2[4] = uint[4](0u, 21u, 43u, 64u);
+const uint kW3[8] = uint[8](0u, 9u, 18u, 27u, 37u, 46u, 55u, 64u);
+const uint kW4[16] = uint[16](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+
+// 2-subset partitions: bit i = subset of pixel i; anchor pixel of subset 1
+const uint kPart2[64] = uint[64](0xccccu, 0x8888u, 0xeeeeu, 0xecc8u, 0xc880u, 0xfeecu, 0xfec8u, 0xec80u, 0xc800u, 0xffecu, 0xfe80u, 0xe800u, 0xffe8u, 0xff00u, 0xfff0u, 0xf000u, 0xf710u, 0x008eu, 0x7100u, 0x08ceu, 0x008cu, 0x7310u, 0x3100u, 0x8cceu, 0x088cu, 0x3110u, 0x6666u, 0x366cu, 0x17e8u, 0x0ff0u, 0x718eu, 0x399cu, 0xaaaau, 0xf0f0u, 0x5a5au, 0x33ccu, 0x3c3cu, 0x55aau, 0x9696u, 0xa55au, 0x73ceu, 0x13c8u, 0x324cu, 0x3bdcu, 0x6996u, 0xc33cu, 0x9966u, 0x0660u, 0x0272u, 0x04e4u, 0x4e40u, 0x2720u, 0xc936u, 0x936cu, 0x39c6u, 0x639cu, 0x9336u, 0x9cc6u, 0x817eu, 0xe718u, 0xccf0u, 0x0fccu, 0x7744u, 0xee22u);
+const uint kAnchor2[64] = uint[64](15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 2u, 8u, 2u, 2u, 8u, 8u, 15u, 2u, 8u, 2u, 2u, 8u, 8u, 2u, 2u, 15u, 15u, 6u, 8u, 2u, 8u, 15u, 15u, 2u, 8u, 2u, 2u, 2u, 15u, 15u, 6u, 6u, 2u, 6u, 8u, 15u, 15u, 2u, 2u, 15u, 15u, 15u, 15u, 15u, 2u, 2u, 15u);
+// 3-subset partitions (mode 0 uses the first 16): 2 bits per pixel; anchors of subsets 1 and 2
+const uint kPart3[16] = uint[16](0xaa685050u, 0x6a5a5040u, 0x5a5a4200u, 0x5450a0a8u, 0xa5a50000u, 0xa0a05050u, 0x5555a0a0u, 0x5a5a5050u, 0xaa550000u, 0xaa555500u, 0xaaaa5500u, 0x90909090u, 0x94949494u, 0xa4a4a4a4u, 0xa9a59450u, 0x2a0a4250u);
+const uint kAnchor3a[16] = uint[16](3u, 3u, 15u, 15u, 8u, 3u, 15u, 15u, 8u, 8u, 6u, 6u, 6u, 5u, 3u, 3u);
+const uint kAnchor3b[16] = uint[16](15u, 8u, 8u, 3u, 15u, 15u, 3u, 8u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 8u);
+
+// endpoint formats
+const uint EP_M6 = 0u;   // 7 bits + p-bit per endpoint (8-bit result), RGBA
+const uint EP_M3 = 1u;   // 7 bits + p-bit per endpoint, RGB
+const uint EP_M1 = 2u;   // 6 bits + one p-bit shared by both endpoints (7-bit result), RGB
+const uint EP_M7 = 3u;   // 5 bits + p-bit per endpoint (6-bit result), RGBA
+const uint EP_M5 = 4u;   // 7 bits, no p-bit, RGB
+const uint EP_M0 = 5u;   // 4 bits + p-bit per endpoint (5-bit result), RGB
+const uint EP_M4 = 6u;   // 5 bits, no p-bit, RGB
+
+ivec4 P[16];        // the block (channels rotated while mode 5 rotations are tried)
+// alpha counts ALPHA_WEIGHT times in the error of blocks with alpha: a compositor shows alpha
+// errors against the background, so an alpha step costs more than the same step in one colour
+// (per channel; mode 4/5 rotations move the alpha weight along with the alpha channel)
+uvec4 gW = uvec4(1u);
+uint gScalarW = 1u;   // weight of the scalar channel (gW.w) captured by fitScalar
+const uint ALPHA_WEIGHT = 3u;
+
+// 16 indices of up to 4 bits packed in a uvec2 (pixels 0-7 in .x, 8-15 in .y): no local arrays
+uint gi(uvec2 v, uint i) { return (v[i >> 3u] >> ((i & 7u) * 4u)) & 15u; }
+void si(inout uvec2 v, uint i, uint x) { uint sh = (i & 7u) * 4u; v[i >> 3u] = (v[i >> 3u] & ~(15u << sh)) | (x << sh); }
+
+uint epBits(uint k) { return k == EP_M1 ? 6u : ((k == EP_M7 || k == EP_M4) ? 5u : (k == EP_M0 ? 4u : 7u)); }
+bool epAlpha(uint k) { return k == EP_M6 || k == EP_M7; }
+bool epHasP(uint k) { return k != EP_M5 && k != EP_M4; }
+uint weightOf(uint idxBits, uint i) { return idxBits == 2u ? kW2[i] : (idxBits == 3u ? kW3[i] : kW4[i]); }
+int expandBits(uint v, uint n) { return n >= 8u ? int(v) : int((v << (8u - n)) | (v >> (2u * n - 8u))); }
+
+// endpoint code -> 8-bit value
+int recon(uint q, uint p, uint k)
+{
+    uint n = epBits(k) + (epHasP(k) ? 1u : 0u);
+    return expandBits(epHasP(k) ? ((q << 1u) | p) : q, n);
+}
+
+// best code for an 8-bit target with the given p-bit
+uint quantize1(float e, uint k, uint p)
+{
+    uint bits = epBits(k);
+    bool hasP = epHasP(k);
+    uint n = bits + (hasP ? 1u : 0u);
+    int q0 = int(round((e * float((1u << n) - 1u) / 255.0 - (hasP ? float(p) : 0.0)) / (hasP ? 2.0 : 1.0)));
+    uint best = 0u; int bestErr = 1 << 30;
+    int target = int(round(e));
+    for (int d = -1; d <= 1; ++d) {
+        int q = clamp(q0 + d, 0, int((1u << bits) - 1u));
+        int err = abs(recon(uint(q), p, k) - target);
+        if (err < bestErr) { bestErr = err; best = uint(q); }
+    }
+    return best;
+}
+
+// nearest palette entries for the pixels in mask; returns the squared error
+uint assignIndices(uint mask, ivec4 e0, ivec4 e1, uint idxBits, bool alpha, inout uvec2 idx)
+{
+    int n = 1 << idxBits;
+    ivec4 d = e1 - e0;
+    if (!alpha) d.w = 0;
+    float dd = float(dot(d, d));
+    float scale = dd > 0.0 ? float(n - 1) / dd : 0.0;
+    uint total = 0u;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        if (((mask >> i) & 1u) == 0u) continue;
+        ivec4 p = P[i];
+        if (!alpha) p.w = 0;
+        int k0 = clamp(int(round(float(dot(p - e0, d)) * scale)), 0, n - 1);
+        uint best = 0u, bestErr = 0xFFFFFFFFu;
+        for (int k = max(k0 - 1, 0); k <= min(k0 + 1, n - 1); ++k) {
+            int w = int(weightOf(idxBits, uint(k)));
+            ivec4 e = (((64 - w) * e0 + w * e1 + 32) >> 6) - P[i];
+            if (!alpha) e.w = 0;
+            uvec4 e2 = uvec4(e * e);
+            uint err = e2.x * gW.x + e2.y * gW.y + e2.z * gW.z + e2.w * gW.w;
+            if (err < bestErr) { bestErr = err; best = uint(k); }
+        }
+        si(idx, i, best);
+        total += bestErr;
+    }
+    return total;
+}
+
+// power-iteration start: the covariance column of the channel that varies most. (The bounding-box
+// diagonal can be exactly perpendicular to the principal axis, e.g. for a red-to-blue edge.)
+vec4 startAxis(mat4 cov)
+{
+    uint c = 0u;
+    for (uint i = 1u; i < 4u; ++i) if (cov[i][i] > cov[c][c]) c = i;
+    vec4 v = cov[c];
+    return dot(v, v) > 1e-12 ? v : vec4(1.0, 1.0, 1.0, 0.0);
+}
+
+// principal-axis endpoints of the pixels in mask
+void initialEndpoints(uint mask, bool alpha, out vec4 lo, out vec4 hi)
+{
+    vec4 mean = vec4(0.0), mn = vec4(255.0), mx = vec4(0.0);
+    float cnt = 0.0;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i)
+        if (((mask >> i) & 1u) != 0u) { vec4 p = vec4(P[i]); mean += p; mn = min(mn, p); mx = max(mx, p); cnt += 1.0; }
+    mean /= max(cnt, 1.0);
+    if (!alpha) { mean.w = 255.0; mn.w = 255.0; mx.w = 255.0; }
+    mat4 cov = mat4(0.0);
+    [[unroll]] for (uint i = 0u; i < 16u; ++i)
+        if (((mask >> i) & 1u) != 0u) {
+            vec4 d = vec4(P[i]) - mean;
+            if (!alpha) d.w = 0.0;
+            cov += outerProduct(d, d);
+        }
+    if (dot(mx - mn, mx - mn) < 1e-6) { lo = mean; hi = mean; return; }
+    vec4 axis = startAxis(cov);
+    for (int it = 0; it < 4; ++it) {
+        vec4 v = cov * axis;
+        float l = length(v);
+        if (l < 1e-6) break;
+        axis = v / l;
+    }
+    axis = normalize(axis);
+    float tmin = 1e9, tmax = -1e9;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i)
+        if (((mask >> i) & 1u) != 0u) {
+            vec4 d = vec4(P[i]) - mean;
+            if (!alpha) d.w = 0.0;
+            float t = dot(d, axis);
+            tmin = min(tmin, t); tmax = max(tmax, t);
+        }
+    lo = clamp(mean + tmin * axis, 0.0, 255.0);
+    hi = clamp(mean + tmax * axis, 0.0, 255.0);
+}
+
+// least-squares endpoints for fixed indices
+void refineEndpoints(uint mask, uint idxBits, uvec2 idx, inout vec4 lo, inout vec4 hi)
+{
+    float a = 0.0, b = 0.0, c = 0.0;
+    vec4 x = vec4(0.0), y = vec4(0.0);
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        if (((mask >> i) & 1u) == 0u) continue;
+        float t = float(weightOf(idxBits, gi(idx, i))) / 64.0, s = 1.0 - t;
+        vec4 p = vec4(P[i]);
+        a += s * s; b += s * t; c += t * t;
+        x += s * p; y += t * p;
+    }
+    float det = a * c - b * b;
+    if (abs(det) < 1e-6) return;
+    lo = clamp((c * x - b * y) / det, 0.0, 255.0);
+    hi = clamp((a * y - b * x) / det, 0.0, 255.0);
+}
+
+// ---- one subset ----------------------------------------------------------------------------
+
+uint  rErr;
+uvec4 rQ0, rQ1;    // endpoint codes (without p-bit)
+uint  rP0, rP1;
+uvec2 rIdx;        // indices of the subset's pixels (others untouched)
+
+// codes -> 8-bit endpoint; formats without alpha decode to 255 (opaque mode 6: code 127, p 1)
+ivec4 reconEP(uvec4 q, uint p, uint k)
+{
+    return ivec4(recon(q.x, p, k), recon(q.y, p, k), recon(q.z, p, k), epAlpha(k) ? recon(q.w, p, k) : 255);
+}
+
+// fit one subset with endpoint format k; opaque: alpha must decode to 255
+void fitSubset(uint mask, uint k, uint idxBits, bool opaque, uint iters, uint nudges)
+{
+    bool alpha = epAlpha(k) && !opaque;      // alpha is fitted (else 255)
+    bool useA = epAlpha(k);                  // alpha counted in the error
+    bool hasP = epHasP(k), sharedP = k == EP_M1;
+    vec4 lo, hi;
+    initialEndpoints(mask, alpha, lo, hi);
+
+    rErr = 0xFFFFFFFFu;
+    uvec2 idx = uvec2(0u);
+    uint combos = !hasP ? 1u : (sharedP ? 2u : 4u);
+
+    // choosing (no nudges): p-bits picked per endpoint by its own rounding error, one index pass
+    // per iteration; finishing: every p-bit combination is tried
+    bool allP = nudges > 0u;
+    for (uint it = 0u; it < max(iters, 1u); ++it) {
+        uint itErr = 0xFFFFFFFFu;
+        uvec2 itIdx = idx;
+        uint bp0 = 0u, bp1 = 0u;
+        if (hasP && !allP && !(k == EP_M6 && opaque)) {
+            uint err0[2], err1[2];
+            for (uint p = 0u; p < 2u; ++p) {
+                err0[p] = 0u; err1[p] = 0u;
+                for (uint c = 0u; c < (alpha ? 4u : 3u); ++c) {
+                    int d0 = recon(quantize1(lo[c], k, p), p, k) - int(round(lo[c]));
+                    int d1 = recon(quantize1(hi[c], k, p), p, k) - int(round(hi[c]));
+                    err0[p] += uint(d0 * d0); err1[p] += uint(d1 * d1);
+                }
+            }
+            if (sharedP) { bp0 = bp1 = (err0[1] + err1[1] < err0[0] + err1[0]) ? 1u : 0u; }
+            else { bp0 = err0[1] < err0[0] ? 1u : 0u; bp1 = err1[1] < err1[0] ? 1u : 0u; }
+        }
+        for (uint cb = 0u; cb < combos; ++cb) {
+            uint p0 = cb & 1u, p1 = sharedP ? p0 : (cb >> 1u);
+            // opaque mode 6: both p-bits 1 so that alpha code 127 decodes to exactly 255
+            if (k == EP_M6 && opaque) { if (cb != 3u) continue; }
+            else if (hasP && !allP && (p0 != bp0 || p1 != bp1)) continue;
+            uvec4 q0, q1;
+            for (uint c = 0u; c < 4u; ++c) {
+                if (c == 3u && !epAlpha(k)) { q0[c] = 0u; q1[c] = 0u; continue; }
+                q0[c] = (c == 3u && opaque) ? 127u : quantize1(lo[c], k, p0);
+                q1[c] = (c == 3u && opaque) ? 127u : quantize1(hi[c], k, p1);
+            }
+            uvec2 cIdx = idx;
+            uint err = assignIndices(mask, reconEP(q0, p0, k), reconEP(q1, p1, k), idxBits, useA, cIdx);
+            if (err < itErr) { itErr = err; itIdx = cIdx; }
+            if (err < rErr) { rErr = err; rQ0 = q0; rQ1 = q1; rP0 = p0; rP1 = p1; rIdx = cIdx; }
+        }
+        if (rErr == 0u) return;
+        idx = itIdx;
+        refineEndpoints(mask, idxBits, idx, lo, hi);
+    }
+
+    // +-1 on each endpoint code while it helps: finds pairs that only reach a colour together
+    // through an interpolated index (a flat colour whose channels need different p-bits, ...)
+    int maxq = int((1u << epBits(k)) - 1u);
+    uint nch = alpha ? 4u : 3u;
+    for (uint round = 0u; round < nudges && rErr > 0u; ++round) {
+        bool improved = false;
+        for (uint ep = 0u; ep < 2u; ++ep)
+            for (uint c = 0u; c < nch; ++c)
+                for (int d = -1; d <= 1; d += 2) {
+                    uvec4 q0 = rQ0, q1 = rQ1;
+                    int q = int(ep == 0u ? q0[c] : q1[c]) + d;
+                    if (q < 0 || q > maxq) continue;
+                    if (ep == 0u) q0[c] = uint(q); else q1[c] = uint(q);
+                    uvec2 cIdx = rIdx;
+                    uint err = assignIndices(mask, reconEP(q0, rP0, k), reconEP(q1, rP1, k), idxBits, useA, cIdx);
+                    if (err < rErr) { rErr = err; rQ0 = q0; rQ1 = q1; rIdx = cIdx; improved = true; }
+                }
+        if (!improved) break;
+    }
+}
+
+// modes 4 and 5: the separate scalar channel (in .w after rotation). Mode 5: 8-bit endpoints,
+// 2-bit indices; mode 4: 6-bit endpoints, 3- or 2-bit indices (the index-selection bit).
+uint sErr, sQ0, sQ1;
+uvec2 sIdx;
+
+uint scalarError(int e0, int e1, uint idxBits, inout uvec2 ti)
+{
+    uint n = 1u << idxBits;
+    uint err = 0u;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        uint bi = 0u, be = 0xFFFFFFFFu;
+        for (uint kk = 0u; kk < n; ++kk) {
+            int w = int(weightOf(idxBits, kk));
+            int d = (((64 - w) * e0 + w * e1 + 32) >> 6) - P[i].w;
+            if (uint(d * d) < be) { be = uint(d * d); bi = kk; }
+        }
+        si(ti, i, bi); err += be;
+    }
+    return err;
+}
+
+uint quantScalar(float e, uint bits)
+{
+    int maxq = int((1u << bits) - 1u);
+    int q0 = clamp(int(round(e * float(maxq) / 255.0)), 0, maxq);
+    uint best = uint(q0); int bestErr = 1 << 30;
+    for (int d = -1; d <= 1; ++d) {
+        int q = clamp(q0 + d, 0, maxq);
+        int err = abs(expandBits(uint(q), bits) - int(round(e)));
+        if (err < bestErr) { bestErr = err; best = uint(q); }
+    }
+    return best;
+}
+
+void fitScalar(uint bits, uint idxBits, uint nudges)
+{
+    gScalarW = gW.w;
+    float lo = 255.0, hi = 0.0;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) { lo = min(lo, float(P[i].w)); hi = max(hi, float(P[i].w)); }
+    sErr = 0xFFFFFFFFu;
+    uvec2 ti = uvec2(0u);
+    for (uint it = 0u; it < 2u; ++it) {
+        uint q0 = quantScalar(lo, bits), q1 = quantScalar(hi, bits);
+        uint err = scalarError(expandBits(q0, bits), expandBits(q1, bits), idxBits, ti);
+        if (err < sErr) { sErr = err; sIdx = ti; sQ0 = q0; sQ1 = q1; }
+        if (sErr == 0u) return;
+        float a = 0.0, b = 0.0, c = 0.0, x = 0.0, y = 0.0;
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+            float t = float(weightOf(idxBits, gi(ti, i))) / 64.0, s = 1.0 - t;
+            a += s * s; b += s * t; c += t * t; x += s * float(P[i].w); y += t * float(P[i].w);
+        }
+        float det = a * c - b * b;
+        if (abs(det) < 1e-6) break;
+        lo = clamp((c * x - b * y) / det, 0.0, 255.0); hi = clamp((a * y - b * x) / det, 0.0, 255.0);
+    }
+    int maxq = int((1u << bits) - 1u);
+    for (uint round = 0u; round < nudges && sErr > 0u; ++round) {
+        bool improved = false;
+        for (uint t = 0u; t < 4u; ++t) {
+            int q0 = int(sQ0), q1 = int(sQ1);
+            if (t < 2u) q0 += t == 0u ? -1 : 1; else q1 += t == 2u ? -1 : 1;
+            if (q0 < 0 || q0 > maxq || q1 < 0 || q1 > maxq) continue;
+            uint err = scalarError(expandBits(uint(q0), bits), expandBits(uint(q1), bits), idxBits, ti);
+            if (err < sErr) { sErr = err; sIdx = ti; sQ0 = uint(q0); sQ1 = uint(q1); improved = true; }
+        }
+        if (!improved) break;
+    }
+}
+
+void rotate(uint r)   // mode 4/5 rotation: swap channel r-1 with alpha (its own inverse)
+{
+    if (r == 0u) return;
+    uint tw = gW[r - 1u]; gW[r - 1u] = gW.w; gW.w = tw;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) { int t = P[i][r - 1u]; P[i][r - 1u] = P[i].w; P[i].w = t; }
+}
+
+// ---- partition estimates: what remains after a best-fit line through each subset -----------
+
+// sums over a subset: count, sum, sum of outer products
+float gN; vec4 gS; mat4 gQ;
+void sums(uint mask, bool alpha)
+{
+    gN = 0.0; gS = vec4(0.0); gQ = mat4(0.0);
+    [[unroll]] for (uint i = 0u; i < 16u; ++i)
+        if (((mask >> i) & 1u) != 0u) {
+            vec4 p = vec4(P[i]); if (!alpha) p.w = 0.0;
+            gN += 1.0; gS += p; gQ += outerProduct(p, p);
+        }
+}
+
+float residualOf(float n, vec4 s, mat4 q, bool alpha)
+{
+    if (n < 1.5) return 0.0;
+    mat4 sc = q - outerProduct(s, s) / n;
+    float tr = sc[0][0] + sc[1][1] + sc[2][2] + sc[3][3];
+    vec4 v = startAxis(sc);
+    for (int it = 0; it < 3; ++it) { vec4 w = sc * v; float l = length(w); if (l < 1e-6) break; v = w / l; }
+    return max(tr - dot(v, sc * v), 0.0);
+}
+
+float residual(uint mask, bool alpha) { sums(mask, alpha); return residualOf(gN, gS, gQ, alpha); }
+
+uint mask3(uint part, uint s)
+{
+    uint m = 0u;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) if (((kPart3[part] >> (2u * i)) & 3u) == s) m |= 1u << i;
+    return m;
+}
+
+// ---- packing -------------------------------------------------------------------------------
+
+void put(inout uvec4 b, inout uint pos, uint v, uint n)
+{
+    uint w = pos >> 5u, off = pos & 31u;
+    b[w] |= v << off;
+    if (off + n > 32u) b[w + 1u] |= v >> (32u - off);
+    pos += n;
+}
+
+// subset results for packing: up to 3 subsets
+uvec4 fQ[6];       // s0e0 s0e1 s1e0 s1e1 s2e0 s2e1
+uint  fP[6];
+uvec2 fIdx;
+
+void takeSubset(uint s, uint mask, uint anchor, uint idxBits)
+{
+    uvec4 q0 = rQ0, q1 = rQ1; uint p0 = rP0, p1 = rP1;
+    uint top = 1u << (idxBits - 1u), maxI = (1u << idxBits) - 1u;
+    bool flip = (gi(rIdx, anchor) & top) != 0u;   // the anchor's top index bit is implied 0
+    if (flip) { uvec4 t = q0; q0 = q1; q1 = t; uint tp = p0; p0 = p1; p1 = tp; }
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) if (((mask >> i) & 1u) != 0u) si(fIdx, i, flip ? maxI - gi(rIdx, i) : gi(rIdx, i));
+    fQ[2u * s] = q0; fQ[2u * s + 1u] = q1; fP[2u * s] = p0; fP[2u * s + 1u] = p1;
+}
+
+// the two best candidates while choosing
+uint cErr[2], cMode[2], cPart[2], cRot[2];
+void offer(uint e, uint mode, uint part, uint rot)
+{
+    if (e >= cErr[1]) return;
+    if (e < cErr[0]) {
+        cErr[1] = cErr[0]; cMode[1] = cMode[0]; cPart[1] = cPart[0]; cRot[1] = cRot[0];
+        cErr[0] = e; cMode[0] = mode; cPart[0] = part; cRot[0] = rot;
+    } else { cErr[1] = e; cMode[1] = mode; cPart[1] = part; cRot[1] = rot; }
+}
+
+// fit a candidate fully; fills fQ/fP/fIdx (and sQ/sIdx for mode 5); returns its error
+uint finish(uint mode, uint part, uint rot, bool opaque, uint fit, uint nudges)
+{
+    if (mode == 6u) {
+        fitSubset(0xFFFFu, EP_M6, 4u, opaque, fit, nudges);
+        uint e = rErr;
+        takeSubset(0u, 0xFFFFu, 0u, 4u);
+        return e;
+    }
+    if (mode == 5u) {
+        rotate(rot);
+        fitSubset(0xFFFFu, EP_M5, 2u, true, fit, nudges);
+        uint e = rErr;
+        takeSubset(0u, 0xFFFFu, 0u, 2u);
+        fitScalar(8u, 2u, nudges);
+        rotate(rot);
+        if ((gi(sIdx, 0u) & 2u) != 0u) { uint t = sQ0; sQ0 = sQ1; sQ1 = t; [[unroll]] for (uint i = 0u; i < 16u; ++i) si(sIdx, i, 3u - gi(sIdx, i)); }
+        return e + gScalarW * sErr;
+    }
+    if (mode == 4u) {   // rot: rotation | index selection << 2
+        uint r = rot & 3u, sel = rot >> 2u, cb = sel == 0u ? 2u : 3u, ab = sel == 0u ? 3u : 2u;
+        rotate(r);
+        fitSubset(0xFFFFu, EP_M4, cb, true, fit, nudges);
+        uint e = rErr;
+        takeSubset(0u, 0xFFFFu, 0u, cb);
+        fitScalar(6u, ab, nudges);
+        rotate(r);
+        uint top = 1u << (ab - 1u), maxI = (1u << ab) - 1u;
+        if ((gi(sIdx, 0u) & top) != 0u) { uint t = sQ0; sQ0 = sQ1; sQ1 = t; [[unroll]] for (uint i = 0u; i < 16u; ++i) si(sIdx, i, maxI - gi(sIdx, i)); }
+        return e + gScalarW * sErr;
+    }
+    if (mode == 0u) {
+        uint e = 0u;
+        for (uint s = 0u; s < 3u; ++s) {
+            uint m = mask3(part, s);
+            fitSubset(m, EP_M0, 3u, false, fit, nudges);
+            e += rErr;
+            takeSubset(s, m, s == 0u ? 0u : (s == 1u ? kAnchor3a[part] : kAnchor3b[part]), 3u);
+        }
+        return e;
+    }
+    uint k = mode == 1u ? EP_M1 : (mode == 3u ? EP_M3 : EP_M7);
+    uint ib = mode == 1u ? 3u : 2u;
+    uint m1 = kPart2[part], m0 = ~m1 & 0xFFFFu;
+    fitSubset(m0, k, ib, false, fit, nudges);
+    uint e = rErr;
+    takeSubset(0u, m0, 0u, ib);
+    fitSubset(m1, k, ib, false, fit, nudges);
+    takeSubset(1u, m1, kAnchor2[part], ib);
+    return e + rErr;
+}
+
+uvec4 pack(uint mode, uint part, uint rot)
+{
+    uvec4 b = uvec4(0u);
+    uint pos = 0u;
+    if (mode == 6u) {
+        put(b, pos, 1u << 6u, 7u);
+        for (uint c = 0u; c < 4u; ++c) { put(b, pos, fQ[0][c], 7u); put(b, pos, fQ[1][c], 7u); }
+        put(b, pos, fP[0], 1u); put(b, pos, fP[1], 1u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, gi(fIdx, i), i == 0u ? 3u : 4u);
+    } else if (mode == 5u) {
+        put(b, pos, 1u << 5u, 6u);
+        put(b, pos, rot, 2u);
+        for (uint c = 0u; c < 3u; ++c) { put(b, pos, fQ[0][c], 7u); put(b, pos, fQ[1][c], 7u); }
+        put(b, pos, sQ0, 8u); put(b, pos, sQ1, 8u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, gi(fIdx, i), i == 0u ? 1u : 2u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, gi(sIdx, i), i == 0u ? 1u : 2u);
+    } else if (mode == 4u) {
+        uint r = rot & 3u, sel = rot >> 2u;
+        put(b, pos, 1u << 4u, 5u);
+        put(b, pos, r, 2u);
+        put(b, pos, sel, 1u);
+        for (uint c = 0u; c < 3u; ++c) { put(b, pos, fQ[0][c], 5u); put(b, pos, fQ[1][c], 5u); }
+        put(b, pos, sQ0, 6u); put(b, pos, sQ1, 6u);
+        // the 2-bit index set first, then the 3-bit set (colour gets the 2-bit set unless sel = 1)
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, sel == 0u ? gi(fIdx, i) : gi(sIdx, i), i == 0u ? 1u : 2u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, sel == 0u ? gi(sIdx, i) : gi(fIdx, i), i == 0u ? 2u : 3u);
+    } else if (mode == 0u) {
+        uint a1 = kAnchor3a[part], a2 = kAnchor3b[part];
+        put(b, pos, 1u, 1u);
+        put(b, pos, part, 4u);
+        for (uint c = 0u; c < 3u; ++c) for (uint e = 0u; e < 6u; ++e) put(b, pos, fQ[e][c], 4u);
+        for (uint e = 0u; e < 6u; ++e) put(b, pos, fP[e], 1u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, gi(fIdx, i), (i == 0u || i == a1 || i == a2) ? 2u : 3u);
+    } else {   // modes 1, 3, 7
+        uint k = mode == 1u ? EP_M1 : (mode == 3u ? EP_M3 : EP_M7);
+        uint ib = mode == 1u ? 3u : 2u, eb = epBits(k), nch = mode == 7u ? 4u : 3u;
+        uint anchor = kAnchor2[part];
+        put(b, pos, 1u << mode, mode + 1u);
+        put(b, pos, part, 6u);
+        for (uint c = 0u; c < nch; ++c) for (uint e = 0u; e < 4u; ++e) put(b, pos, fQ[e][c], eb);
+        if (mode == 1u) { put(b, pos, fP[0], 1u); put(b, pos, fP[2], 1u); }
+        else for (uint e = 0u; e < 4u; ++e) put(b, pos, fP[e], 1u);
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) put(b, pos, gi(fIdx, i), (i == 0u || i == anchor) ? ib - 1u : ib);
+    }
+    return b;
+}
+
+void main()
+{
+    uint block = pc.startBlock + gl_GlobalInvocationID.x;
+    if (block >= pc.numBlocks) return;
+    uint by = block / pc.blocksX, bx = block - by * pc.blocksX;
+    bool opaque = true;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        uint v = px[(by * 4u + (i >> 2u)) * pc.width + bx * 4u + (i & 3u)];
+        P[i] = ivec4(int(v & 255u), int((v >> 8u) & 255u), int((v >> 16u) & 255u), int(v >> 24u));
+        if (P[i].w != 255) opaque = false;
+    }
+    uint iters = pc.iterations;
+    gW = uvec4(1u, 1u, 1u, opaque ? 1u : ALPHA_WEIGHT);
+
+    // ---- 1. choose: keep the two best candidates
+    cErr[0] = cErr[1] = 0xFFFFFFFFu;
+    fitSubset(0xFFFFu, EP_M6, 4u, opaque, iters, 0u);
+    offer(rErr, 6u, 0u, 0u);
+
+    if (cErr[0] > 0u)
+        for (uint r = 0u; r < 4u; ++r) {
+            rotate(r);
+            fitSubset(0xFFFFu, EP_M5, 2u, true, iters, 0u);
+            uint e = rErr;
+            fitScalar(8u, 2u, 0u);
+            rotate(r);
+            offer(e + gScalarW * sErr, 5u, 0u, r);
+        }
+
+    // mode 4 (blocks with alpha): 5-bit colour + 6-bit scalar, one of them with 3-bit indices
+    if (cErr[0] > 0u && !opaque)
+        for (uint r = 0u; r < 4u; ++r)
+            for (uint sel = 0u; sel < 2u; ++sel) {
+                rotate(r);
+                fitSubset(0xFFFFu, EP_M4, sel == 0u ? 2u : 3u, true, iters, 0u);
+                uint e = rErr;
+                fitScalar(6u, sel == 0u ? 3u : 2u, 0u);
+                rotate(r);
+                offer(e + gScalarW * sErr, 4u, 0u, r | (sel << 2u));
+            }
+
+    if (cErr[0] > 0u) {
+        float est[64];
+        sums(0xFFFFu, !opaque);
+        float tN = gN; vec4 tS = gS; mat4 tQ = gQ;
+        for (uint p = 0u; p < 64u; ++p) {
+            sums(kPart2[p], !opaque);
+            est[p] = residualOf(gN, gS, gQ, !opaque) + residualOf(tN - gN, tS - gS, tQ - gQ, !opaque);
+        }
+        for (uint t = 0u; t < clamp(pc.partitions, 1u, 64u); ++t) {
+            uint part = 0u; float lowest = 3.4e38;
+            for (uint p = 0u; p < 64u; ++p) if (est[p] < lowest) { lowest = est[p]; part = p; }
+            est[part] = 3.4e38;
+            for (uint pass = 0u; pass < (opaque ? 2u : 1u); ++pass) {
+                uint mode = opaque ? (pass == 0u ? 1u : 3u) : 7u;
+                uint k = mode == 1u ? EP_M1 : (mode == 3u ? EP_M3 : EP_M7);
+                uint ib = mode == 1u ? 3u : 2u;
+                fitSubset(kPart2[part], k, ib, false, iters, 0u);
+                uint e = rErr;
+                if (e >= cErr[1]) continue;
+                fitSubset(~kPart2[part] & 0xFFFFu, k, ib, false, iters, 0u);
+                offer(e + rErr, mode, part, 0u);
+            }
+        }
+    }
+
+    if (cErr[0] > 0u && opaque && pc.partitions3 > 0u) {
+        float est3[16];
+        for (uint p = 0u; p < 16u; ++p) est3[p] = residual(mask3(p, 0u), false) + residual(mask3(p, 1u), false) + residual(mask3(p, 2u), false);
+        for (uint t = 0u; t < min(pc.partitions3, 16u); ++t) {
+            uint part = 0u; float lowest = 3.4e38;
+            for (uint p = 0u; p < 16u; ++p) if (est3[p] < lowest) { lowest = est3[p]; part = p; }
+            est3[part] = 3.4e38;
+            uint e = 0u;
+            for (uint s = 0u; s < 3u && e < cErr[1]; ++s) { fitSubset(mask3(part, s), EP_M0, 3u, false, iters, 0u); e += rErr; }
+            offer(e, 0u, part, 0u);
+        }
+    }
+
+    // ---- 2. finish both candidates (more refinement, +-1 code search) and pack the better one
+    uint fit = iters + 1u;
+    uint e0 = finish(cMode[0], cPart[0], cRot[0], opaque, fit, pc.nudges);
+    uvec4 b = pack(cMode[0], cPart[0], cRot[0]);
+    if (e0 > 0u && cErr[1] != 0xFFFFFFFFu) {
+        uint e1 = finish(cMode[1], cPart[1], cRot[1], opaque, fit, pc.nudges);
+        if (e1 < e0) b = pack(cMode[1], cPart[1], cRot[1]);
+    }
+    blocks[block] = b;
+}

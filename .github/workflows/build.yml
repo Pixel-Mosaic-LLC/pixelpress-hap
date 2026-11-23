@@ -1,0 +1,123 @@
+name: Build installers
+# Manual only (Actions tab -> Run workflow): no Actions credits, builds are done locally
+on:
+  workflow_dispatch:
+
+# CMake 4 on the runners rejects the old snappy/squish CMakeLists without this
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+  PYTHONUTF8: '1'
+
+jobs:
+  mac:
+    name: macOS (Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+      - name: Unpack project
+        id: loc
+        run: |
+          if f=$(git ls-files | grep -m1 'scripts/build-mac.sh$'); then d=$(dirname "$(dirname "$f")")
+          else zips=$(git ls-files | grep -i '\.zip$' | grep -iv 'sdk' | grep -iv 'fallback')
+               # newest versioned zip (PixelPressHAP-1.1.0.zip ...), else any project zip
+               z=$(echo "$zips" | grep -E -- '-[0-9]+(\.[0-9]+)+\.zip$' | sort -V | tail -1); [ -n "$z" ] || z=$(echo "$zips" | head -1); [ -n "$z" ] || { echo "::error::Upload PixelPressHAP.zip to the repo"; exit 1; }
+               python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('proj')" "$z"
+               d=$(dirname "$(dirname "$(find proj -path '*scripts/build-mac.sh' | head -1)")"); fi
+          chmod +x "$d"/scripts/*.sh "$d"/installer/preinstall
+          echo "dir=$d" >> $GITHUB_OUTPUT; echo "Project folder: $d  (from ${z:-repo tree})"
+      - name: Adobe SDKs
+        working-directory: ${{ steps.loc.outputs.dir }}
+        env:
+          ADOBE_SDK_ZIP_URL: ${{ secrets.ADOBE_SDK_ZIP_URL }}   # private download link, stored as a repo secret
+        run: python3 scripts/get_adobe_sdk.py
+      - name: Build
+        working-directory: ${{ steps.loc.outputs.dir }}
+        run: bash scripts/build-mac.sh
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -n 's/^set(CPACK_PACKAGE_VERSION "\(.*\)")/\1/p' "${{ steps.loc.outputs.dir }}/installer/CodecInstaller.cmake")
+          [ -n "$v" ] || { echo "::error::no CPACK_PACKAGE_VERSION"; exit 1; }
+          echo "v=$v" >> $GITHUB_OUTPUT; echo "Version: $v"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: PixelPressHAP-${{ steps.ver.outputs.v }}-macOS-AppleSilicon
+          path: ${{ steps.loc.outputs.dir }}/dist/*.pkg
+
+  # 1.1.7: LGPL ffmpeg.exe / ffprobe.exe for the Windows installer (C:\Program Files\PixelPress),
+  # cross-compiled with MinGW-w64 - see scripts/build-ffmpeg-win-exe.sh
+  ffmpeg-win:
+    name: ffmpeg for Windows (LGPL)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Unpack project
+        id: loc
+        run: |
+          if f=$(git ls-files | grep -m1 'scripts/build-ffmpeg-win-exe.sh$'); then d=$(dirname "$(dirname "$f")")
+          else zips=$(git ls-files | grep -i '\.zip$' | grep -iv 'sdk' | grep -iv 'fallback')
+               z=$(echo "$zips" | grep -E -- '-[0-9]+(\.[0-9]+)+\.zip$' | sort -V | tail -1); [ -n "$z" ] || z=$(echo "$zips" | head -1); [ -n "$z" ] || { echo "::error::Upload PixelPressHAP.zip to the repo"; exit 1; }
+               python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('proj')" "$z"
+               d=$(dirname "$(dirname "$(find proj -path '*scripts/build-ffmpeg-win-exe.sh' | head -1)")"); fi
+          echo "dir=$d" >> $GITHUB_OUTPUT; echo "Project folder: $d  (from ${z:-repo tree})"
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64 nasm cmake make pkg-config
+      - name: Build
+        run: bash "${{ steps.loc.outputs.dir }}/scripts/build-ffmpeg-win-exe.sh" "$GITHUB_WORKSPACE/ffmpeg-win"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-win
+          path: ffmpeg-win
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    needs: ffmpeg-win
+    steps:
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MSYS
+          install: make diffutils
+      - name: Unpack project
+        id: loc
+        shell: bash
+        run: |
+          if f=$(git ls-files | grep -m1 'scripts/build-win.ps1$'); then d=$(dirname "$(dirname "$f")")
+          else zips=$(git ls-files | grep -i '\.zip$' | grep -iv 'sdk' | grep -iv 'fallback')
+               # newest versioned zip (PixelPressHAP-1.1.0.zip ...), else any project zip
+               z=$(echo "$zips" | grep -E -- '-[0-9]+(\.[0-9]+)+\.zip$' | sort -V | tail -1); [ -n "$z" ] || z=$(echo "$zips" | head -1); [ -n "$z" ] || { echo "::error::Upload PixelPressHAP.zip to the repo"; exit 1; }
+               python -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall('proj')" "$z"
+               d=$(dirname "$(dirname "$(find proj -path '*scripts/build-win.ps1' | head -1)")"); fi
+          echo "dir=$d" >> $GITHUB_OUTPUT; echo "Project folder: $d  (from ${z:-repo tree})"
+      - uses: actions/download-artifact@v6
+        with:
+          name: ffmpeg-win
+          path: ${{ steps.loc.outputs.dir }}/dist/ffmpeg-win
+      - name: NSIS
+        shell: pwsh
+        run: if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y --no-progress }
+      - name: Adobe SDKs
+        working-directory: ${{ steps.loc.outputs.dir }}
+        env:
+          ADOBE_SDK_ZIP_URL: ${{ secrets.ADOBE_SDK_ZIP_URL }}   # private download link, stored as a repo secret
+        run: python scripts/get_adobe_sdk.py
+      - name: Build
+        working-directory: ${{ steps.loc.outputs.dir }}
+        shell: pwsh
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: ./scripts/build-win.ps1
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -n 's/^set(CPACK_PACKAGE_VERSION "\(.*\)")/\1/p' "${{ steps.loc.outputs.dir }}/installer/CodecInstaller.cmake")
+          [ -n "$v" ] || { echo "::error::no CPACK_PACKAGE_VERSION"; exit 1; }
+          echo "v=$v" >> $GITHUB_OUTPUT; echo "Version: $v"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: PixelPressHAP-${{ steps.ver.outputs.v }}-Windows-x64
+          path: ${{ steps.loc.outputs.dir }}/dist/*.exe

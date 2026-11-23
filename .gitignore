@@ -1,0 +1,32 @@
+.DS_store
+.DS_Store
+.vscode
+build/
+external/adobe/premiere/
+Release/
+Debug/
+Xcode/
+
+# PixelPress HAP build outputs and fetched third-party sources
+build-mac-*/
+build-win/
+dist/
+external/foundation/external/ffmpeg/FFmpeg/
+external/foundation/external/json/
+external/foundation/external/StackWalker/
+external/foundation/external/googletest/
+external/foundation/external/adobe/AfterEffectsSDK/
+external/foundation/external/adobe/premiere/
+build-selftest/
+.tools/
+build-selftest-*/
+# also when they are symlinks to an unpacked SDK (a trailing / only matches directories)
+external/foundation/external/adobe/AfterEffectsSDK
+external/foundation/external/adobe/premiere
+.build-win-cross/
+external/foundation/external/StackWalker/
+
+# Adobe SDKs are licensed by Adobe and must never be committed
+adobe-sdk/*
+!adobe-sdk/README.md
+.claude/

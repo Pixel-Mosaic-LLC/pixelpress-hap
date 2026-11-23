@@ -1,0 +1,4 @@
+b2c2baf8d91ac60fddde39cbb0997a677db831a2
+8ba9502fb30d2bf728592d121f0d402e40c8cb05
+PixelPress change: common/compiler_gcc.h - MinGW build fix (see comment there).
+PixelPress change: lib/arm/ added (Apple Silicon build).

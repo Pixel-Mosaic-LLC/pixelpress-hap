@@ -1,0 +1,6 @@
+.DS_store
+.vscode
+build/
+external/adobe/premiere/
+external/adobe/AfterEffectsSDK/
+Release/

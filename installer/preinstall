@@ -1,0 +1,12 @@
+#!/bin/sh
+# PixelPress HAP pre-install: remove only our own previous version so upgrades are clean.
+# (The upstream script also deleted the disguise HapEncoderPlugin.bundle - not done here,
+#  PixelPress HAP is designed to live alongside it.)
+set -e
+INSTALL_LOCATION="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore"
+for PLUGIN in PPHAPPlugin.bundle PPHAPPremierePlugin.bundle PPHAPAfterEffectsPlugin.bundle PPHAPAfterEffectsPlugin.plugin; do
+    if [ -d "$INSTALL_LOCATION/$PLUGIN" ]; then
+        rm -r "$INSTALL_LOCATION/$PLUGIN"
+    fi
+done
+exit 0
